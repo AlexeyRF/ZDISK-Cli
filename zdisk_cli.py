@@ -4,17 +4,24 @@ import sys
 import json
 import argparse
 import logging
+import shlex
 from datetime import datetime
 from pathlib import Path
 import qrcode
 from zdisk_client import ZDiskClient
-from pymax.crud import Database
 
 # Configure logging to be less verbose by default
 logging.basicConfig(level=logging.WARNING, format='%(levelname)s: %(message)s')
 logger = logging.getLogger("zdisk_cli")
 
-SETTINGS_FILE = "zdisk_settings.json"
+# Try to load settings from current working directory first, fallback to script directory
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if os.path.exists("zdisk_settings.json") or not os.access(SCRIPT_DIR, os.W_OK):
+    SETTINGS_FILE = os.path.abspath("zdisk_settings.json")
+    CACHE_DIR = os.path.abspath("cache")
+else:
+    SETTINGS_FILE = os.path.join(SCRIPT_DIR, "zdisk_settings.json")
+    CACHE_DIR = os.path.join(SCRIPT_DIR, "cache")
 
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
@@ -26,6 +33,8 @@ def load_settings():
     return {"target_chat_id": 0, "passwords": {}}
 
 def save_settings(settings):
+    # Ensure directory exists
+    os.makedirs(os.path.dirname(SETTINGS_FILE), exist_ok=True)
     with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
         json.dump(settings, f, indent=4, ensure_ascii=False)
 
@@ -56,15 +65,18 @@ class ZDiskCLI:
 
     async def init_client(self):
         self.client = ZDiskClient(
+            work_dir=CACHE_DIR,
             target_chat_id=self.settings.get("target_chat_id"),
             loop=self.loop
         )
 
     async def ensure_auth(self):
-        db = Database("cache")
-        token = db.get_auth_token()
+        from pymax.session.store import SessionStore
+        store = SessionStore(CACHE_DIR, "session.db")
+        session = await store.load_session()
+        await store.close()
         
-        if not token:
+        if not session or not session.token:
             print("Сессия не найдена. Требуется вход.")
             await self.login()
         else:
@@ -74,6 +86,134 @@ class ZDiskCLI:
             except asyncio.TimeoutError:
                 print("Ошибка: Превышено время ожидания авторизации. Попробуйте войти снова.")
                 await self.login()
+
+    async def run_shell(self):
+        print("\n=== ZDisk Interactive Shell ===")
+        print("Команды: ls [path], cd [path], upload [file] [path], download [file] [dest], rm [file], mkdir [path], trash, config --chat ID, exit")
+        current_path = "/"
+        
+        if self.settings.get("target_chat_id") == 0:
+            print("Предупреждение: target_chat_id не задан. Используйте 'config --chat ID'.")
+        else:
+            try:
+                await self.ensure_auth()
+            except Exception as e:
+                print(f"Ошибка авторизации: {e}")
+
+        while True:
+            try:
+                prompt = f"zdisk:{current_path}> "
+                line = await self.loop.run_in_executor(None, input, prompt)
+                if not line.strip():
+                    continue
+                
+                parts = shlex.split(line)
+                cmd = parts[0].lower()
+                args = parts[1:]
+                
+                if cmd in ["exit", "quit", "bye"]:
+                    break
+                elif cmd == "ls":
+                    path = args[0] if args else current_path
+                    if not path.startswith("/"):
+                        path = os.path.join(current_path, path).replace("\\", "/")
+                    await self.list_files(path)
+                elif cmd == "cd":
+                    new_path = args[0] if args else "/"
+                    if new_path == "..":
+                        if current_path != "/":
+                            current_path = "/".join(current_path.strip("/").split("/")[:-1])
+                            if not current_path.startswith("/"): current_path = "/" + current_path
+                    elif new_path.startswith("/"):
+                        current_path = new_path
+                    else:
+                        current_path = os.path.join(current_path, new_path).replace("\\", "/")
+                    
+                    if not current_path.startswith("/"): current_path = "/" + current_path
+                    if len(current_path) > 1: current_path = current_path.rstrip("/")
+                elif cmd == "upload":
+                    if len(args) < 1:
+                        print("Использование: upload <file> [target_path]")
+                        continue
+                    file_path = args[0]
+                    target = args[1] if len(args) > 1 else current_path
+                    if not target.startswith("/"):
+                        target = os.path.join(current_path, target).replace("\\", "/")
+                    await self.upload(file_path, target)
+                elif cmd == "download":
+                    if len(args) < 1:
+                        print("Использование: download <file> [dest_dir]")
+                        continue
+                    file_name = args[0]
+                    dest = args[1] if len(args) > 1 else "."
+                    await self.download(file_name, dest)
+                elif cmd == "rm":
+                    if len(args) < 1:
+                        print("Использование: rm <file> [--permanent]")
+                        continue
+                    perm = "--permanent" in args or "--permament" in args
+                    other_args = [a for a in args if a not in ["--permanent", "--permament"]]
+                    if not other_args:
+                        print("Использование: rm <file> [--permanent]")
+                        continue
+                    fname = other_args[0]
+                    await self.delete(fname, perm)
+                elif cmd == "mkdir":
+                    if len(args) < 1:
+                        print("Использование: mkdir <path>")
+                        continue
+                    path = args[0]
+                    if not path.startswith("/"):
+                        path = os.path.join(current_path, path).replace("\\", "/")
+                    await self.mkdir(path)
+                elif cmd == "trash":
+                    if "--list" in args:
+                        await self.show_trash()
+                    elif "--restore" in args:
+                        idx = args.index("--restore")
+                        if idx + 1 < len(args):
+                            try:
+                                await self.restore_trash(int(args[idx+1]))
+                            except ValueError:
+                                print("Ошибка: Индекс должен быть числом.")
+                        else:
+                            print("Использование: trash --restore <index>")
+                    elif "--clear" in args:
+                        idx = args.index("--clear")
+                        val = None
+                        if idx + 1 < len(args):
+                            try:
+                                val = int(args[idx+1])
+                            except ValueError:
+                                pass
+                        await self.clear_trash(val)
+                    else:
+                        await self.show_trash()
+                elif cmd == "config":
+                    if "--chat" in args:
+                        idx = args.index("--chat")
+                        if idx + 1 < len(args):
+                            try:
+                                new_chat = int(args[idx+1])
+                                self.settings['target_chat_id'] = new_chat
+                                save_settings(self.settings)
+                                self.client.target_chat_id = new_chat
+                                print(f"ID чата изменен на {new_chat}")
+                                if self.client.is_authorized is False:
+                                    await self.ensure_auth()
+                            except ValueError:
+                                print("Ошибка: ID чата должен быть числом.")
+                    else:
+                        print(f"Текущий ID чата: {self.settings.get('target_chat_id')}")
+                elif cmd == "help":
+                    print("Доступные команды: ls, cd, upload, download, rm, mkdir, trash, config, exit")
+                else:
+                    print(f"Неизвестная команда: {cmd}")
+                    
+            except KeyboardInterrupt:
+                print("\nИспользуйте 'exit' для выхода")
+            except Exception as e:
+                print(f"Ошибка: {e}")
 
     async def login(self):
         print("Генерация QR-кода для входа...")
@@ -188,15 +328,19 @@ class ZDiskCLI:
 
     async def delete(self, filename, permanent=False):
         files = await self.client.fetch_files(limit=1000)
+        trash_metadata = await self.client.load_trash_metadata()
+        trash_ids = {mid for t in trash_metadata for mid in t.get('msg_ids', [])}
+        
         target = None
         for f in files:
             full = (f['path'].strip("/") + "/" + f['name']).strip("/")
             if full == filename.strip("/") or f['name'] == filename:
-                target = f
-                break
+                if f['msg_id'] not in trash_ids:
+                    target = f
+                    break
         
         if not target:
-            print(f"Ошибка: Файл '{filename}' не найден.")
+            print(f"Ошибка: Файл '{filename}' не найден или уже в корзине.")
             return
 
         if permanent:
@@ -241,9 +385,7 @@ class ZDiskCLI:
                 print("Ошибка: Неверный индекс.")
         else:
             print("Очистка всей корзины...")
-            metadata = await self.client.load_trash_metadata()
-            for item in metadata:
-                await self.client.permanent_delete_trash(item)
+            await self.client.clear_all_trash()
             print("Корзина очищена.")
 
     async def mkdir(self, path):
@@ -278,7 +420,7 @@ async def main():
     # RM
     rm_parser = subparsers.add_parser("rm", help="Удалить файл")
     rm_parser.add_argument("file", help="Имя файла или путь в облаке")
-    rm_parser.add_argument("--permanent", action="store_true", help="Удалить окончательно (мимо корзины)")
+    rm_parser.add_argument("--permanent", "--permament", action="store_true", dest="permanent", help="Удалить окончательно (мимо корзины)")
 
     # MKDIR
     mkdir_parser = subparsers.add_parser("mkdir", help="Создать папку")
@@ -289,6 +431,9 @@ async def main():
     trash_parser.add_argument("--list", action="store_true", help="Показать содержимое")
     trash_parser.add_argument("--restore", type=int, help="Восстановить по индексу")
     trash_parser.add_argument("--clear", type=int, nargs="?", const=-1, help="Очистить (индекс или все)")
+
+    # Shell
+    subparsers.add_parser("shell", help="Запустить интерактивный режим")
 
     # Settings
     set_parser = subparsers.add_parser("config", help="Настройки")
@@ -305,12 +450,12 @@ async def main():
         print("Настройки сохранены.")
         return
 
-    if not args.command:
-        parser.print_help()
-        return
-
     cli = ZDiskCLI(settings)
     await cli.init_client()
+
+    if not args.command or args.command == "shell":
+        await cli.run_shell()
+        return
 
     if args.command == "login":
         await cli.login()

@@ -4,22 +4,59 @@ import logging
 import json
 from datetime import datetime
 from pathlib import Path
-from pymax import MaxClient, File, AttachType
-from pymax.static.enum import AuthType, DeviceType, Opcode
-from pymax.types import FileAttach, Message
-from pymax.exceptions import WebSocketNotConnectedError
+from pymax import WebClient, File
+from pymax.protocol import Opcode
+from pymax.types import FileAttachment, Message
+from pymax.exceptions import PyMaxError
 from zdisk_crypto import ZDiskCrypto
 from zdisk_files import ZDiskFiles
 import shutil
+
 logger = logging.getLogger("zdisk_client")
+
+# Monkeypatch LoginResponse and AuthService in pymax to make 'token' field optional
+# and automatically carry over the current session token if the server response lacks one.
+try:
+    from pymax.types.domain.login import LoginResponse
+    from pymax.api.auth.service import AuthService
+    from typing import Optional
+
+    token_field = LoginResponse.model_fields.get("token")
+    if token_field:
+        token_field.default = None
+        token_field.annotation = Optional[str]
+        LoginResponse.__annotations__["token"] = Optional[str]
+        LoginResponse.model_rebuild(force=True)
+
+    original_login = AuthService.login
+    async def patched_login(self, *args, **kwargs):
+        response = await original_login(self, *args, **kwargs)
+        if response and response.token is None and self.app.session is not None:
+            response.token = self.app.session.token
+        return response
+    AuthService.login = patched_login
+except Exception as e:
+    logger.warning(f"Failed to patch pymax Login: {e}")
+
+
+class MyQrHandler:
+    def __init__(self, callback):
+        self.callback = callback
+
+    async def show_qr(self, qr_url: str) -> None:
+        if self.callback:
+            self.callback(qr_url)
 
 class ZDiskClient:
     def __init__(self, work_dir: str = "cache", target_chat_id: int = 0, loop=None):
         self.work_dir = work_dir
         self.target_chat_id = target_chat_id
         self.loop = loop or asyncio.get_event_loop()
-        # Используем фиксированное имя сессии для CLI
-        self.client = MaxClient(phone="zdisk_session", work_dir=work_dir)
+        self.client = WebClient(
+            session_name="session.db",
+            work_dir=work_dir,
+            qr_provider=MyQrHandler(self._custom_print_qr)
+        )
         self.crypto = ZDiskCrypto()
         self.files = ZDiskFiles()
         
@@ -30,9 +67,7 @@ class ZDiskClient:
         self.on_ready = None # function()
         self.on_qr_received = None # function(link)
         
-        self.client.on_start(self._on_client_start)
-        # Переопределяем метод печати QR, чтобы перехватить ссылку
-        self.client._print_qr = self._custom_print_qr
+        self.client.on_start()(self._on_client_start)
 
     def _custom_print_qr(self, link: str):
         if self.on_qr_received:
@@ -44,7 +79,7 @@ class ZDiskClient:
             qr.add_data(link)
             qr.print_ascii()
 
-    async def _on_client_start(self):
+    async def _on_client_start(self, client=None):
         self.is_authorized = True
         if self.on_ready:
             await self.on_ready()
@@ -60,35 +95,20 @@ class ZDiskClient:
             logger.exception("Error starting client")
             raise
 
+    async def request_code(self):
+        raise NotImplementedError("SMS code auth is deprecated/unused in QR flow")
+
     async def get_qr_data(self):
-        """Requests QR login data. Returns (link, track_id, polling_interval, expires_at)."""
-        data = await self.client._request_qr_login()
-        return data.get("qrLink"), data.get("trackId"), data.get("pollingInterval"), data.get("expiresAt")
+        raise NotImplementedError("Custom QR flow is deprecated, use automatic start flow")
 
     async def poll_qr_status(self, track_id: str):
-        """Polls for QR login confirmation. Returns True if confirmed, False otherwise."""
-        data = await self.client._send_and_wait(
-            opcode=Opcode.GET_QR_STATUS,
-            payload={"trackId": track_id},
-        )
-        payload = data.get("payload", {})
-        status = payload.get("status", {})
-        return status.get("loginAvailable", False)
+        raise NotImplementedError("Custom QR flow is deprecated, use automatic start flow")
 
     async def complete_qr_login(self, track_id: str):
-        """Completes the QR login process after confirmation."""
-        data = await self.client._get_qr_login_data(track_id)
-        # data contains tokenAttrs
-        login_attrs = data.get("tokenAttrs", {}).get("LOGIN", {})
-        token = login_attrs.get("token")
-        if token:
-            self.client._token = token
-            self.client._database.update_auth_token(self.client._device_id, token)
-            self.is_authorized = True
-            if not self.auth_future.done():
-                self.auth_future.set_result(True)
-            return True
-        return False
+        raise NotImplementedError("Custom QR flow is deprecated, use automatic start flow")
+
+    async def submit_code(self, temp_token: str, code: str):
+        raise NotImplementedError("SMS code auth is deprecated/unused in QR flow")
 
     async def _with_retry(self, coro_func, *args, **kwargs):
         """Executes a coroutine function with retries on websocket disconnection."""
@@ -96,16 +116,11 @@ class ZDiskClient:
         for attempt in range(max_retries):
             try:
                 return await coro_func(*args, **kwargs)
-            except (WebSocketNotConnectedError, ConnectionError, asyncio.TimeoutError) as e:
+            except (PyMaxError, ConnectionError, asyncio.TimeoutError) as e:
                 logger.warning(f"Connection error (attempt {attempt+1}/{max_retries}): {e}")
                 if attempt < max_retries - 1:
-                    # Try to reconnect
-                    try:
-                        await self.client.connect()
-                        # Give it a moment
-                        await asyncio.sleep(1)
-                    except Exception as re_e:
-                        logger.error(f"Reconnection failed: {re_e}")
+                    # Give automatic reconnection some time
+                    await asyncio.sleep(2)
                 else:
                     raise
         return None
@@ -141,7 +156,7 @@ class ZDiskClient:
         for msg in history:
             if msg.attaches:
                 for attach in msg.attaches:
-                    if isinstance(attach, FileAttach):
+                    if isinstance(attach, FileAttachment):
                         name = attach.name
                         path = ""
                         is_part = False
@@ -190,8 +205,51 @@ class ZDiskClient:
         return file_messages
 
     async def delete_file(self, msg_id: int):
-        """Deletes a file (message) from the target chat."""
-        return await self._with_retry(self.client.delete_message, chat_id=self.target_chat_id, message_ids=[msg_id], for_me=False)
+        """Deletes a file (including manifest and all parts) from the target chat."""
+        history = await self._with_retry(self.client.fetch_history, chat_id=self.target_chat_id, backward=100)
+        message_ids = [msg_id]
+        if history:
+            manifest_msg = None
+            for m in history:
+                if m.id == msg_id:
+                    manifest_msg = m
+                    break
+            if manifest_msg and manifest_msg.text:
+                if manifest_msg.text.startswith("MANIFEST:"):
+                    full_name = manifest_msg.text[9:]
+                    part_prefix = f"PART:{full_name}:"
+                    for m in history:
+                        if m.text and m.text.startswith(part_prefix):
+                            message_ids.append(m.id)
+        return await self._with_retry(self.client.delete_message, chat_id=self.target_chat_id, message_ids=message_ids, for_me=False)
+
+    async def send_message(self, text: str, chat_id: int, attachments=None):
+        """Sends a message bypassing the markdown formatter to preserve underscores and technical chars."""
+        from pymax.protocol.enums import Opcode
+        from pymax.api.response import require_payload_model
+        from pymax.types.domain import Message
+        from pymax.api.messages.payloads import SendMessagePayload, SendMessagePayloadMessage
+
+        cid = self.client._app.api.messages._next_cid()
+        
+        attaches = []
+        if attachments:
+            attaches = await self.client._app.api.messages._upload_attachments(attachments)
+
+        frame = SendMessagePayload(
+            chat_id=chat_id,
+            message=SendMessagePayloadMessage(
+                text=text,
+                cid=cid,
+                elements=[],
+                attaches=attaches,
+            ),
+            notify=True
+        )
+        
+        response = await self._with_retry(self.client._app.invoke, Opcode.MSG_SEND, frame.to_payload())
+        message = require_payload_model(response, Message).bind(self.client._app.api.messages)
+        return message
 
     async def load_trash_metadata(self) -> list:
         """Loads trash metadata from the chat history."""
@@ -207,35 +265,84 @@ class ZDiskClient:
                 try:
                     data = json.loads(msg.text[15:])
                     if isinstance(data, list):
-                        return data
+                        # Нормализуем ключи для совместимости с поврежденными сообщениями (без подчеркиваний)
+                        normalized_data = []
+                        for item in data:
+                            normalized_item = {
+                                'name': item.get('name', ''),
+                                'path': item.get('path', ''),
+                                'deleted_at': item.get('deleted_at', item.get('deletedat', 0.0)),
+                                'msg_ids': item.get('msg_ids', item.get('msgids', []))
+                            }
+                            normalized_data.append(normalized_item)
+                        return normalized_data
                 except:
                     continue
         return []
 
     async def save_trash_metadata(self, metadata: list):
-        """Saves trash metadata as a message."""
-        # We don't delete old metadata messages to avoid edit timeouts, 
-        # just send a new one. It will be found as the latest.
-        await self.client.send_message(
+        """Saves trash metadata as a message and deletes the old ones."""
+        # Find old trash metadata messages
+        history = await self._with_retry(self.client.fetch_history, chat_id=self.target_chat_id, backward=100)
+        old_metadata_msg_ids = []
+        if history:
+            for msg in history:
+                if msg.text and msg.text.startswith("TRASH_METADATA:"):
+                    old_metadata_msg_ids.append(msg.id)
+        
+        # Send new metadata message
+        await self.send_message(
             text=f"TRASH_METADATA:{json.dumps(metadata)}",
             chat_id=self.target_chat_id
         )
+        
+        # Delete old metadata messages
+        if old_metadata_msg_ids:
+            try:
+                await self._with_retry(
+                    self.client.delete_message,
+                    chat_id=self.target_chat_id,
+                    message_ids=old_metadata_msg_ids,
+                    for_me=False
+                )
+            except Exception as e:
+                logger.error(f"Failed to delete old trash metadata messages: {e}")
 
     async def move_to_trash(self, name: str, path: str, msg_ids: list):
-        """Adds items to trash metadata."""
+        """Adds items to trash metadata, automatically including all parts for split files."""
+        history = await self._with_retry(self.client.fetch_history, chat_id=self.target_chat_id, backward=100)
+        resolved_msg_ids = list(msg_ids)
+        if history:
+            for mid in msg_ids:
+                manifest_msg = None
+                for m in history:
+                    if m.id == mid:
+                        manifest_msg = m
+                        break
+                if manifest_msg and manifest_msg.text and manifest_msg.text.startswith("MANIFEST:"):
+                    full_name = manifest_msg.text[9:]
+                    part_prefix = f"PART:{full_name}:"
+                    for m in history:
+                        if m.text and m.text.startswith(part_prefix) and m.id not in resolved_msg_ids:
+                            resolved_msg_ids.append(m.id)
+
         metadata = await self.load_trash_metadata()
+        existing_msg_ids = {mid for m in metadata for mid in m.get('msg_ids', [])}
+        new_msg_ids = [mid for mid in resolved_msg_ids if mid not in existing_msg_ids]
+        if not new_msg_ids:
+            return
+            
         metadata.append({
             'name': name,
             'path': path,
             'deleted_at': datetime.now().timestamp(),
-            'msg_ids': msg_ids
+            'msg_ids': new_msg_ids
         })
         await self.save_trash_metadata(metadata)
 
     async def restore_from_trash(self, item_data: dict):
         """Removes items from trash metadata."""
         metadata = await self.load_trash_metadata()
-        # Filter out the item to restore
         new_metadata = [m for m in metadata if not (m['deleted_at'] == item_data['deleted_at'] and m['name'] == item_data['name'])]
         await self.save_trash_metadata(new_metadata)
 
@@ -246,7 +353,26 @@ class ZDiskClient:
                                    chat_id=self.target_chat_id, 
                                    message_ids=item_data['msg_ids'], 
                                    for_me=False)
-        await self.restore_from_trash(item_data) # Just removes from metadata
+        await self.restore_from_trash(item_data)
+
+    async def clear_all_trash(self):
+        """Permanently deletes all items in the trash and empties it."""
+        metadata = await self.load_trash_metadata()
+        if not metadata:
+            return
+        all_msg_ids = []
+        for item in metadata:
+            if item.get('msg_ids'):
+                all_msg_ids.extend(item['msg_ids'])
+        if all_msg_ids:
+            try:
+                await self._with_retry(self.client.delete_message, 
+                                       chat_id=self.target_chat_id, 
+                                       message_ids=all_msg_ids, 
+                                       for_me=False)
+            except Exception as e:
+                logger.error(f"Failed to bulk delete trash messages: {e}")
+        await self.save_trash_metadata([])
 
     async def cleanup_trash(self):
         """Deletes items older than 30 days from trash."""
@@ -265,35 +391,51 @@ class ZDiskClient:
         new_metadata = [m for m in metadata if now - m['deleted_at'] <= limit]
         await self.save_trash_metadata(new_metadata)
 
+    async def edit_message(self, chat_id: int, message_id: int, text: str):
+        """Edits an existing message's text using MSG_EDIT opcode."""
+        from pymax.protocol.enums import Opcode
+        from pymax.formatting.markdown import Formatter
+        import time
+
+        clean_text, elements = Formatter.format_markdown(text)
+        cid = int(time.time() * 1000)
+        
+        payload = {
+            "chatId": chat_id,
+            "messageId": message_id,
+            "message": {
+                "text": clean_text,
+                "cid": cid,
+                "elements": elements,
+                "attaches": []
+            }
+        }
+        return await self._with_retry(self.client._app.invoke, Opcode.MSG_EDIT, payload)
+
     async def rename_file(self, msg_id: int, path: str, new_name: str):
         """Renames a file by editing the message text."""
         full_path = f"{path.strip('/')}/{new_name}" if path else new_name
-        # We need to preserve the prefix (FILE:, MANIFEST:, etc)
-        # For simplicity, we assume we can just get the current message and swap the name.
-        # But MaxClient might not have a direct "get message by id" that returns the text easily without history.
-        # We'll use a generic approach of sending an edit command if supported.
-        new_text = f"FILE:{full_path}" # Simplification, should ideally match original prefix
-        return await self._with_retry(self.client.edit_message, chat_id=self.target_chat_id, message_id=msg_id, text=new_text)
+        new_text = f"FILE:{full_path}"
+        return await self.edit_message(chat_id=self.target_chat_id, message_id=msg_id, text=new_text)
 
     async def move_file(self, msg_id: int, new_path: str, name: str):
         """Moves a file by editing the message text."""
         full_path = f"{new_path.strip('/')}/{name}" if new_path else name
         new_text = f"FILE:{full_path}"
-        return await self._with_retry(self.client.edit_message, chat_id=self.target_chat_id, message_id=msg_id, text=new_text)
+        return await self.edit_message(chat_id=self.target_chat_id, message_id=msg_id, text=new_text)
 
     async def create_folder(self, target_path: str):
         """Creates a folder by uploading a dummy .keeper file."""
-        import tempfile
         with tempfile.NamedTemporaryFile(mode='w', delete=False, encoding='utf-8', dir=str(self.files.temp_dir)) as f:
             f.write("keep_folder")
             temp_path = f.name
         
         try:
             # Upload as .keeper
-            await self.client.send_message(
+            await self.send_message(
                 text=f"FILE:{target_path.strip('/')}/.keeper",
                 chat_id=self.target_chat_id,
-                attachment=File(path=temp_path)
+                attachments=[File(path=temp_path)]
             )
         finally:
             self.files.cleanup(temp_path)
@@ -340,10 +482,10 @@ class ZDiskClient:
                     manifest_file = prep['manifest_file']
                     
                     # Send manifest first
-                    msg = await self.client.send_message(
+                    msg = await self.send_message(
                         text=f"MANIFEST:{full_name_with_path}",
                         chat_id=self.target_chat_id,
-                        attachment=File(path=manifest_file)
+                        attachments=[File(path=manifest_file)]
                     )
                     # Ждем, пока сообщение действительно будет отправлено (id появится)
                     while not msg.id:
@@ -355,10 +497,10 @@ class ZDiskClient:
                         if progress_callback:
                             progress_callback(i + 1, len(parts), f"Отправка части {i+1}/{len(parts)}")
                         
-                        part_msg = await self.client.send_message(
+                        part_msg = await self.send_message(
                             text=f"PART:{full_name_with_path}:{i+1}",
                             chat_id=self.target_chat_id,
-                            attachment=File(path=str(part))
+                            attachments=[File(path=str(part))]
                         )
                         # Важно дождаться подтверждения отправки каждой части
                         while not part_msg.id:
@@ -372,10 +514,10 @@ class ZDiskClient:
                     # Normal upload
                     if progress_callback:
                         progress_callback(0, 1, "Загрузка файла...")
-                    msg = await self.client.send_message(
+                    msg = await self.send_message(
                         text=f"FILE:{full_name_with_path}",
                         chat_id=self.target_chat_id,
-                        attachment=File(path=current_path)
+                        attachments=[File(path=current_path)]
                     )
                     while not msg.id:
                         await asyncio.sleep(0.5)
