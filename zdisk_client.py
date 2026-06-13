@@ -392,25 +392,8 @@ class ZDiskClient:
         await self.save_trash_metadata(new_metadata)
 
     async def edit_message(self, chat_id: int, message_id: int, text: str):
-        """Edits an existing message's text using MSG_EDIT opcode."""
-        from pymax.protocol.enums import Opcode
-        from pymax.formatting.markdown import Formatter
-        import time
-
-        clean_text, elements = Formatter.format_markdown(text)
-        cid = int(time.time() * 1000)
-        
-        payload = {
-            "chatId": chat_id,
-            "messageId": message_id,
-            "message": {
-                "text": clean_text,
-                "cid": cid,
-                "elements": elements,
-                "attaches": []
-            }
-        }
-        return await self._with_retry(self.client._app.invoke, Opcode.MSG_EDIT, payload)
+        """Edits an existing message's text."""
+        return await self._with_retry(self.client.edit_message, chat_id=chat_id, message_id=message_id, text=text)
 
     async def rename_file(self, msg_id: int, path: str, new_name: str):
         """Renames a file by editing the message text."""

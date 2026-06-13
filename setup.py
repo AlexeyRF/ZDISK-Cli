@@ -7,7 +7,7 @@ setup(
     install_requires=[
         "cryptography",
         "aiohttp",
-        "maxapi-python",
+        "maxapi-python>=2.2.0",
         "qrcode",
     ],
     entry_points={
